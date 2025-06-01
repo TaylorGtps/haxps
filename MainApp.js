@@ -1,8 +1,5 @@
 // importing necessary modules
 const path = require("path");
-const app = express();
-const proxy = require('./CacheProxy');
-app.use('/', proxy);
 const express = require("express");
 
 // creating an express app
