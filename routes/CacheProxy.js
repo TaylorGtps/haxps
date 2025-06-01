@@ -1,12 +1,13 @@
-const router = require("express").Router();
-const fetch = require("node-fetch");
-const https = require("https");
-const os = require("os");
+const express = require('express');
+const router = express.Router();
+const fetch = require('node-fetch');
+const https = require('https');
+const os = require('os');
 
 // Bypass SSL
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
-// In-memory cache (only headers, not body)
+// Header-only Cache
 const responseCache = new Map();
 const CACHE_EXPIRATION = 60 * 60 * 1000; // 1 hour
 
@@ -16,79 +17,84 @@ const blacklist = [
     "gtp2929.xml", "gtps3333.xml"
 ];
 
-const checkMemoryUsage = () => {
-    const totalMemory = os.totalmem();
-    const freeMemory = os.freemem();
-    const usedMemory = ((totalMemory - freeMemory) / totalMemory) * 100;
-    if (usedMemory > 80) {
-        console.warn("Memory > 80%, clearing cache...");
+// Memory check
+function checkMemoryUsage() {
+    const used = ((os.totalmem() - os.freemem()) / os.totalmem()) * 100;
+    if (used > 80) {
+        console.warn("Memory > 80%, clearing cache.");
         responseCache.clear();
     }
-};
+}
 
-const cleanExpiredCache = () => {
+// Clean expired cache
+setInterval(() => {
     const now = Date.now();
-    for (const [key, entry] of responseCache.entries()) {
-        if (now > entry.expiry) responseCache.delete(key);
+    for (const [key, { expiry }] of responseCache.entries()) {
+        if (now > expiry) responseCache.delete(key);
     }
-};
-setInterval(cleanExpiredCache, 5 * 60 * 1000);
+}, 5 * 60 * 1000);
 
+// Main Proxy Route
 router.get("/:ip/cache/*", async (req, res, next) => {
-    if (!req.params.ip.match(/^\d{1,3}(\.\d{1,3}){3}$/)) return next();
+    const ip = req.params.ip;
+    const fullUrl = req.originalUrl;
+    const cacheKey = `${req.method}:${fullUrl}`;
+    const force = req.query.force === 'true';
+    const now = Date.now();
+
+    if (!ip.match(/^\d{1,3}(\.\d{1,3}){3}$/)) return next();
+
+    if (blacklist.some(bad => fullUrl.includes(bad))) {
+        console.warn(`Blocked: ${fullUrl}`);
+        return res.status(404).send("Blocked");
+    }
+
+    checkMemoryUsage();
+
+    const cached = responseCache.get(cacheKey);
+    if (!force && cached && now < cached.expiry) {
+        console.log(`Cache HIT: ${cacheKey}`);
+        res.writeHead(cached.status, {
+            ...cached.headers,
+            'X-Cache': 'HIT'
+        });
+        return res.end("Cached response header only (body not stored).");
+    }
+
+    delete req.headers["content-length"];
+    delete req.headers["transfer-encoding"];
+    req.headers.host = "www.growtopia1.com";
+
+    const agent = new https.Agent({ rejectUnauthorized: false });
+
+    const options = {
+        method: req.method,
+        headers: req.headers,
+        agent: agent
+    };
 
     try {
-        const originalUrl = req.originalUrl;
-        const isBlacklisted = blacklist.some(item => originalUrl.includes(item));
-        if (isBlacklisted) {
-            console.warn(`Blocked: ${originalUrl}`);
-            return res.status(404).send("Access Denied");
-        }
+        const targetUrl = 'https:/' + fullUrl;
+        const startTime = Date.now();
+        const response = await fetch(targetUrl, options);
+        const fetchTime = Date.now() - startTime;
+        console.log(`Fetched ${targetUrl} in ${fetchTime}ms`);
 
-        checkMemoryUsage();
-
-        const cacheKey = `${req.method}:${originalUrl}`;
-        const now = Date.now();
-        const cached = responseCache.get(cacheKey);
-        const forceRefresh = req.query.force === "true";
-
-        if (!forceRefresh && cached && now < cached.expiry) {
-            console.log(`Cache HIT headers only: ${cacheKey}`);
-            res.writeHead(cached.status, cached.headers);
-            return res.end("Cached body not available in stream mode.");
-        }
-
-        delete req.headers["content-length"];
-        delete req.headers["transfer-encoding"];
-        req.headers.host = "www.growtopia1.com";
-
-        const agent = new https.Agent({ rejectUnauthorized: false });
-
-        const options = {
-            method: req.method,
-            headers: req.headers,
-            agent: agent
-        };
-
-        const fetchUrl = "https:/" + originalUrl;
-        const start = Date.now();
-        const response = await fetch(fetchUrl, options);
-        const duration = Date.now() - start;
-
-        console.log(`Fetched in ${duration}ms → ${fetchUrl}`);
-
-        // Set headers (except problematic ones)
         const headersToSend = {};
         response.headers.forEach((value, key) => {
-            if (!["content-length", "transfer-encoding"].includes(key.toLowerCase())) {
-                res.setHeader(key, value);
+            if (!['content-length', 'transfer-encoding'].includes(key.toLowerCase())) {
                 headersToSend[key] = value;
+                res.setHeader(key, value);
             }
         });
 
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('Cache-Control', 'no-transform');
+        res.setHeader('X-Cache', 'MISS');
+
         res.status(response.status);
 
-        // Cache only headers
+        // Cache header only
         if (response.status === 200) {
             responseCache.set(cacheKey, {
                 status: response.status,
@@ -97,12 +103,12 @@ router.get("/:ip/cache/*", async (req, res, next) => {
             });
         }
 
-        // Pipe the response directly (FASTEST)
+        // STREAM response body to client
         response.body.pipe(res);
 
     } catch (err) {
-        console.error("Error:", err);
-        res.status(500).send("Internal Server Error");
+        console.error("Proxy Error:", err);
+        res.status(500).send("Proxy Error");
     }
 });
 
