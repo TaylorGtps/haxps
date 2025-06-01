@@ -6,7 +6,7 @@ const os = require("os");
 // Bypass SSL
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
-// Simple in-memory cache
+// In-memory cache (only headers, not body)
 const responseCache = new Map();
 const CACHE_EXPIRATION = 60 * 60 * 1000; // 1 hour
 
@@ -16,60 +16,51 @@ const blacklist = [
     "gtp2929.xml", "gtps3333.xml"
 ];
 
-// Check system memory usage
 const checkMemoryUsage = () => {
     const totalMemory = os.totalmem();
     const freeMemory = os.freemem();
-    const usedMemoryPercentage = ((totalMemory - freeMemory) / totalMemory) * 100;
-
-    if (usedMemoryPercentage > 80) {
-        console.warn('Memory usage exceeds 80%, clearing all cache...');
+    const usedMemory = ((totalMemory - freeMemory) / totalMemory) * 100;
+    if (usedMemory > 80) {
+        console.warn("Memory > 80%, clearing cache...");
         responseCache.clear();
     }
-    return usedMemoryPercentage;
 };
 
-// Clean expired cache entries
 const cleanExpiredCache = () => {
     const now = Date.now();
     for (const [key, entry] of responseCache.entries()) {
-        if (now > entry.expiry) {
-            responseCache.delete(key);
-        }
+        if (now > entry.expiry) responseCache.delete(key);
     }
 };
-setInterval(cleanExpiredCache, 5 * 60 * 1000); // every 5 mins
+setInterval(cleanExpiredCache, 5 * 60 * 1000);
 
-// Route handler
 router.get("/:ip/cache/*", async (req, res, next) => {
-    if (!req.params.ip.match(/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/)) return next();
+    if (!req.params.ip.match(/^\d{1,3}(\.\d{1,3}){3}$/)) return next();
 
     try {
         const originalUrl = req.originalUrl;
         const isBlacklisted = blacklist.some(item => originalUrl.includes(item));
         if (isBlacklisted) {
-            console.warn(`Blocked blacklisted URL: ${originalUrl}`);
-            return res.status(404).send('Access Denied');
+            console.warn(`Blocked: ${originalUrl}`);
+            return res.status(404).send("Access Denied");
         }
 
         checkMemoryUsage();
 
-        const cacheKey = `${req.method}:${req.originalUrl}`;
+        const cacheKey = `${req.method}:${originalUrl}`;
         const now = Date.now();
         const cached = responseCache.get(cacheKey);
-        const forceRefresh = req.query.force === 'true';
+        const forceRefresh = req.query.force === "true";
 
         if (!forceRefresh && cached && now < cached.expiry) {
-            console.log(`Cache HIT: ${cacheKey}`);
+            console.log(`Cache HIT headers only: ${cacheKey}`);
             res.writeHead(cached.status, cached.headers);
-            return res.end(cached.body);
+            return res.end("Cached body not available in stream mode.");
         }
 
-        console.log(forceRefresh ? `Force refresh for: ${cacheKey}` : `Cache MISS: ${cacheKey}`);
-
-        delete req.headers['content-length'];
-        delete req.headers['transfer-encoding'];
-        req.headers.host = 'www.growtopia1.com';
+        delete req.headers["content-length"];
+        delete req.headers["transfer-encoding"];
+        req.headers.host = "www.growtopia1.com";
 
         const agent = new https.Agent({ rejectUnauthorized: false });
 
@@ -79,48 +70,39 @@ router.get("/:ip/cache/*", async (req, res, next) => {
             agent: agent
         };
 
-        if (req.method === 'POST' || req.method === 'PUT') {
-            const chunks = [];
-            await new Promise(resolve => {
-                req.on('data', chunk => chunks.push(chunk));
-                req.on('end', () => {
-                    if (chunks.length) {
-                        options.body = Buffer.concat(chunks);
-                    }
-                    resolve();
-                });
-            });
-        }
-
-        const fetchUrl = 'https:/' + originalUrl;
-        const startTime = Date.now();
+        const fetchUrl = "https:/" + originalUrl;
+        const start = Date.now();
         const response = await fetch(fetchUrl, options);
-        const elapsed = Date.now() - startTime;
-        console.log(`Fetched from origin in ${elapsed}ms -> ${fetchUrl}`);
+        const duration = Date.now() - start;
 
+        console.log(`Fetched in ${duration}ms → ${fetchUrl}`);
+
+        // Set headers (except problematic ones)
         const headersToSend = {};
         response.headers.forEach((value, key) => {
-            if (key.toLowerCase() !== 'content-length' && key.toLowerCase() !== 'transfer-encoding') {
+            if (!["content-length", "transfer-encoding"].includes(key.toLowerCase())) {
+                res.setHeader(key, value);
                 headersToSend[key] = value;
             }
         });
 
-        const buffer = await response.buffer();
-        res.writeHead(response.status, headersToSend);
-        res.end(buffer);
+        res.status(response.status);
 
+        // Cache only headers
         if (response.status === 200) {
             responseCache.set(cacheKey, {
                 status: response.status,
                 headers: headersToSend,
-                body: buffer,
                 expiry: now + CACHE_EXPIRATION
             });
         }
 
-    } catch (error) {
-        console.error('Error:', error);
-        res.status(200).send('Internal Server Error');
+        // Pipe the response directly (FASTEST)
+        response.body.pipe(res);
+
+    } catch (err) {
+        console.error("Error:", err);
+        res.status(500).send("Internal Server Error");
     }
 });
 
