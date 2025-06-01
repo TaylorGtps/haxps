@@ -4,12 +4,10 @@ const fetch = require('node-fetch');
 const https = require('https');
 const os = require('os');
 
-// Bypass SSL
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"; // Bypass SSL
 
-// Header-only Cache
 const responseCache = new Map();
-const CACHE_EXPIRATION = 60 * 60 * 1000; // 1 hour
+const CACHE_EXPIRATION = 60 * 60 * 1000;
 
 const blacklist = [
     "ezdekauti8338.xml", "dongoautis333.xml", "sigmabangget.xml",
@@ -17,11 +15,11 @@ const blacklist = [
     "gtp2929.xml", "gtps3333.xml"
 ];
 
-// Memory check
+// Auto clear if memory > 80%
 function checkMemoryUsage() {
     const used = ((os.totalmem() - os.freemem()) / os.totalmem()) * 100;
     if (used > 80) {
-        console.warn("Memory > 80%, clearing cache.");
+        console.warn("Memory high, clearing cache.");
         responseCache.clear();
     }
 }
@@ -34,7 +32,7 @@ setInterval(() => {
     }
 }, 5 * 60 * 1000);
 
-// Main Proxy Route
+// Main route
 router.get("/:ip/cache/*", async (req, res, next) => {
     const ip = req.params.ip;
     const fullUrl = req.originalUrl;
@@ -43,8 +41,7 @@ router.get("/:ip/cache/*", async (req, res, next) => {
     const now = Date.now();
 
     if (!ip.match(/^\d{1,3}(\.\d{1,3}){3}$/)) return next();
-
-    if (blacklist.some(bad => fullUrl.includes(bad))) {
+    if (blacklist.some(entry => fullUrl.includes(entry))) {
         console.warn(`Blocked: ${fullUrl}`);
         return res.status(404).send("Blocked");
     }
@@ -58,7 +55,7 @@ router.get("/:ip/cache/*", async (req, res, next) => {
             ...cached.headers,
             'X-Cache': 'HIT'
         });
-        return res.end("Cached response header only (body not stored).");
+        return res.end("Cached (headers only).");
     }
 
     delete req.headers["content-length"];
@@ -75,10 +72,10 @@ router.get("/:ip/cache/*", async (req, res, next) => {
 
     try {
         const targetUrl = 'https:/' + fullUrl;
-        const startTime = Date.now();
+        const start = Date.now();
         const response = await fetch(targetUrl, options);
-        const fetchTime = Date.now() - startTime;
-        console.log(`Fetched ${targetUrl} in ${fetchTime}ms`);
+        const duration = Date.now() - start;
+        console.log(`Fetched ${targetUrl} in ${duration}ms`);
 
         const headersToSend = {};
         response.headers.forEach((value, key) => {
@@ -92,9 +89,14 @@ router.get("/:ip/cache/*", async (req, res, next) => {
         res.setHeader('Cache-Control', 'no-transform');
         res.setHeader('X-Cache', 'MISS');
 
+        // ⬇️ Tambahkan fitur download langsung
+        const fileName = fullUrl.split('/').pop();
+        if (fileName.endsWith('.xml') || fileName.endsWith('.rttex')) {
+            res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+        }
+
         res.status(response.status);
 
-        // Cache header only
         if (response.status === 200) {
             responseCache.set(cacheKey, {
                 status: response.status,
@@ -103,7 +105,7 @@ router.get("/:ip/cache/*", async (req, res, next) => {
             });
         }
 
-        // STREAM response body to client
+        // Streaming langsung (super cepat)
         response.body.pipe(res);
 
     } catch (err) {
